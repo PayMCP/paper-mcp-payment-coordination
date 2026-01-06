@@ -2,7 +2,8 @@
 
 This repository contains the paper source and figures for:
 
-**Payment Coordination Patterns for MCP: A Design Taxonomy, Reference Wrapper, and Compatibility Snapshot**
+**Payment Coordination Patterns for MCP: A Design Taxonomy, Reference Wrapper, and Compatibility Snapshot**  
+DOI: [https://doi.org/10.5281/zenodo.18158720](https://doi.org/10.5281/zenodo.18158720)
 
 ## Abstract
 The Model Context Protocol (MCP) enables large language model (LLM) applications to invoke server-hosted tools via a standardized client–server protocol. Introducing payment-gated tool execution creates a coordination challenge: clients and servers must enforce payment without degrading user experience or destabilizing tool selection. This paper presents a taxonomy of payment coordination patterns for MCP, analyzes their assumptions and failure modes, and discusses UX and security trade-offs observed across current MCP clients. The work focuses on practical engineering design rather than payment economics and is intended to support practitioners building paid MCP-based systems.
@@ -38,9 +39,9 @@ The paper is accompanied by reference wrappers:
 ## Citation
 If you use this work, please cite it as:
 
-> Eugene Lobachev, Prasanna Kumar, Arjun Subedi, Bishnu Bista. *Payment Coordination Patterns for MCP: A Design Taxonomy, Reference Wrapper, and Compatibility Snapshot.* (preprint/technical report), 2026.
+> Eugene Lobachev, Prasanna Kumar, Arjun Subedi, Bishnu Bista. *Payment Coordination Patterns for MCP: A Design Taxonomy, Reference Wrapper, and Compatibility Snapshot.* (preprint/technical report), 2026. DOI: https://doi.org/10.5281/zenodo.18158720
 
-A BibTeX entry / DOI will be added once available.
+BibTeX and other citation formats are available on the Zenodo record: [https://doi.org/10.5281/zenodo.18158720](https://doi.org/10.5281/zenodo.18158720).
 
 ## License
 This work is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
