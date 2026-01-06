@@ -1,0 +1,597 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{amssymb}
+\usepackage{listings}
+
+\usepackage{caption}
+% Make all figure/table captions smaller (does not affect body text)
+\captionsetup{font=small, labelfont=bf}
+\usepackage{float}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\bfseries\color{blue!70!black},
+  commentstyle=\itshape\color{gray!70!black},
+  stringstyle=\color{green!40!black},
+  frame=single,
+  showstringspaces=false,
+  breaklines=true,
+  captionpos=b
+}
+
+\title{Payment Coordination Patterns for MCP: A Design Taxonomy, Reference Wrapper, and Compatibility Snapshot}
+\author{
+Eugene Lobachev\and
+Prasanna Kumar\and
+Arjun Subedi\and
+Bishnu Bista
+}
+
+\date{5 January 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Model Context Protocol (MCP) standardizes communication between large language model (LLM) clients and server-hosted tools, enabling flexible tool invocation. However, the introduction of payment tool execution raises a key coordination problem: the challenge of ensuring seamless payment validation between client and server without degrading user experience and affecting the reliability of LLM tool selection.
+
+We categorize payment coordination patterns for MCP--TWO\_STEP, RESUBMIT, X402, ELICITATION, PROGRESS, DYNAMIC\_TOOLS, and an emerging URL\_ELICITATION variant -- identifying their assumptions, failure modes, and security/UX trade-offs. Originally, MCP tools followed a single-shot execution model; payment gating was later introduced by partitioning execution into request and confirm phases. New MCP features, including elicitation, progress updates, and dynamic tool lists, extend this design space, but are not yet uniformly implemented across clients.
+
+Our contributions are threefold: (1) a capability-aligned taxonomy of payment coordination patterns, (2) a reference wrapper that transparently enforces payment gating for existing developer tools, and (3) a compatibility snapshot based on declared client capabilities and observed initialize payloads, with practical notes on how these features tend to surface in common MCP clients. 
+
+This work focuses on engineering design for AI systems rather than payment economics. Our aim is to help practitioners integrate paywalls into MCP safely, predictably, and with a better user experience.
+\end{abstract}
+
+\section{Introduction}
+The Model Context Protocol (MCP) standardizes how LLM applications (clients) discover and invoke server-hosted tools, exchanging context over a JSON-RPC-based session with explicit capability negotiation. As MCP expands across IDEs and chat interfaces, developers increasingly expose paid tools whose execution must be gated upon successful payment. The central challenge is orchestrating this gate so that the MCP client, server, and human user remain in sync---without destabilizing the LLM's tool selection or degrading usability.
+
+We use the term \emph{payment coordination pattern} to denote how an MCP server and client cooperate to request, verify, and acknowledge payment during a tool's lifecycle. We adopt a neutral protocol-level framework and analyze the patterns independently of any single SDK.
+
+Naming note: pattern labels (TWO\_STEP, RESUBMIT, X402, ELICITATION, PROGRESS, DYNAMIC\_TOOLS, URL\_ELICITATION) are author-proposed taxonomy terms rather than official MCP specification names; each maps either to standard MCP features (for example, elicitation, progress, and \texttt{tools/listChanged}) or to an external protocol name (for example, X402).
+
+Historically, MCP tools were executed as single-run functions: they could not pause mid-execution to ask for additional input or a payment. A common retrofit is TWO\_STEP, which splits a paid operation into (i) a ``request'' tool that returns a payment link and (ii) a ``confirm'' tool that checks status before performing the actual work. Although simple and widely compatible, TWO\_STEP can stress the selection of LLM tools as users connect more servers and tools; models can pick the wrong tool or hallucinate intermediate steps or incorrect flows.
+
+ A related variant, RESUBMIT, returns a structured error (for example, indicating that payment is required) with a payment link and id on the first call; after payment, the caller resubmits with \texttt{payment\_id} and the server executes. An on-chain variation, X402, follows the same high-level retry shape but returns an X402 payment request instead of a generic link and requires the caller (or an attached wallet) to resubmit with a cryptographic payment signature rather than a bare \texttt{payment\_id}. This keeps a single-tool surface, but risks argument drift and depends on error payloads being visible or otherwise exposed to the payment-handling layer.
+
+Recent MCP features enable seamless in-flow coordination. Elicitation lets servers pause a tool to request user input (for example, payment confirmation) and then resume, turning formerly single-shot tools into interactive workflows. Progress notifications provide long running status updates and may carry a human-readable message that can include a payment link. The DYNAMIC\_TOOLS pattern uses \texttt{tools/listChanged} to allow servers to expose or hide follow-up tools (for example, \texttt{confirm\_payment\_\{short\_id\}}) at specific points, steering the client and LLM toward the next required step. These capabilities expand the design space but are unevenly supported across clients: elicitation and dynamic tools are not yet universal, and many clients suppress the progress message text, limiting its usefulness for payment links.
+
+An emerging URL\_ELICITATION variant improves reliability by conveying links in a dedicated URL field that clients are expected to handle (for example, prompt the user and open a browser). However, the server still must learn completion state out-of-band (webhook or polling), making robust confirmation logic essential. The DYNAMIC\_TOOLS approach also introduces UX risks (tools may disappear or reappear unexpectedly) and caching concerns that can confuse both users and models.
+
+Our contributions are threefold: (1) a capability-aligned taxonomy of MCP payment coordination patterns (TWO\_STEP, RESUBMIT, X402, ELICITATION, PROGRESS, DYNAMIC\_TOOLS, URL\_ELICITATION) with assumptions, failure modes, and UX/security trade-offs; (2) a lightweight reference wrapper that converts existing developer tools into payment-gated tools without duplicating business logic; and (3) a compatibility snapshot and practical notes on model behavior in common chat clients. Finally, Section~\ref{sec:compatibility} summarizes cross-client support, and Table~\ref{tab:client-support} outlines client-declared capabilities relevant to portability. Later sections discuss implications for production deployments. We target engineering design for AI systems, with connections to AI tooling and human–computer interaction; we do not study pricing models or economic modeling.
+
+\section{Background}
+The Model Context Protocol (MCP)~\cite{mcp-spec-2025-11-25} standardizes how AI applications (clients) connect to server-hosted capabilities such as tools, resources, and prompts using JSON-RPC over standard transports (stdio or streamable HTTP). During initialization, clients and servers negotiate capabilities and then exchange bidirectional typed requests, responses, and notifications across an established session. This session model is the substrate on which payment coordination patterns operate. See the official architecture overview~\cite{mcp-architecture} for a concise primer.
+
+Tools are the primary execution primitive: servers declare the tools capability~\cite{mcp-tools} and may advertise support for dynamic listings (via \texttt{notifications/tools/list\_changed})~\cite{mcp-schema}, which allows a server to notify the client that its available tools have changed. Clients typically discover tools with \texttt{tools/list}~\cite{mcp-tools} and then invoke them. Figure~\ref{fig:freetool} illustrates a standard client--server interaction for a free tool.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{diagrams/figure_freetool.pdf}
+  \caption{Overview of an MCP client--server interaction for an example image tool. The server returns an image URL to the client; in practice some MCP clients may return data directly to the user (binary, JSON, or URL) without involving the LLM.}
+  \label{fig:freetool}
+\end{figure}
+
+MCP has introduced features that enable interactive flows inside tool execution. Elicitation~\cite{mcp-elicitation} lets a server pause an in-flight tool to request additional user input (for example, confirmation or missing fields) and then resume, without forcing a separate tool call. The specification treats elicitation as a client capability and includes guidance on UX and safety.
+
+For long-running operations, progress notifications~\cite{mcp-progress} allow servers to report status increments and (optionally) attach a human-readable message; clients may choose how to display these updates (if the client surfaces message text).
+
+To steer workflows, servers can use dynamic tools with \texttt{notifications/tools/list\_changed}~\cite{mcp-schema} so the client (and indirectly, the model's tool selection) sees only the next valid step---for example, briefly exposing a \texttt{confirm\_payment\_\{short\_id\}} tool and then reverting to the original tool set after completion.
+
+An emerging variant, URL\_ELICITATION~\cite{sep1036}, conveys links in a dedicated \texttt{url} field for reliable, out-of-band actions (for example, opening a browser for OAuth or payment). Community proposals and SDK issues track this mode; servers still confirm completion via webhook or polling.
+
+\section{Related Work}
+\label{sec:related-work}
+
+Payment coordination for AI-powered tools intersects several research areas: protocol design for distributed systems, API monetization, and emerging AI agent architectures.
+
+\paragraph{API monetization and metering.}
+Traditional API monetization typically relies on authentication, metering, and billing at the HTTP/API layer. Platforms like Stripe and PayPal provide payment gateways that applications integrate directly into their request/response paths. However, these solutions assume direct client-server communication and do not account for an intermediary LLM that selects and invokes tools on behalf of users. Our work addresses the unique challenge of coordinating payment when tool invocation is mediated by a language model.
+
+\paragraph{MCP ecosystem and extensions.}
+The Model Context Protocol~\cite{mcp-spec-2025-11-25} has rapidly evolved since its introduction, with community proposals for elicitation~\cite{mcp-elicitation}, progress notifications~\cite{mcp-progress}, and structured URL fields (SEP-1036)~\cite{sep1036}. Security considerations have also emerged, including the SAFE-MCP framework~\cite{safe-mcp} for threat modeling. Our taxonomy complements these efforts by focusing specifically on the payment coordination problem.
+
+\paragraph{AI agent architectures.}
+Recent work on autonomous AI agents explores how LLMs can plan and execute multi-step tasks~\cite{mcp-architecture}. As agents gain access to paid services, the question of payment authorization becomes critical. Unlike traditional software that executes deterministically, LLM-based agents may exhibit non-deterministic behavior, complicating payment flows. Our patterns address this by providing structured coordination mechanisms that account for model uncertainty.
+
+\paragraph{Positioning of this work.}
+To our knowledge, this is the first systematic taxonomy of payment coordination patterns for the MCP ecosystem. While prior work has addressed MCP security and capability negotiation, the specific problem of gating tool execution on payment verification---while preserving UX and model reliability---has not been formally analyzed.
+
+Finally, the specification documents related building blocks---lifecycle (init/operate/shutdown), logging, cancellation, and evolving authorization guidance---which underpin robust client--server behavior and are relevant when discussing reliability and security considerations. See also the draft Security Best Practices~\cite{mcp-security-best-practices} for additional guidance on notifications and cross-server interactions.
+
+\section{Taxonomy of Payment Coordination Patterns}
+We define a payment coordination pattern as a client--server protocol strategy that gates tool execution on successful payment while keeping the MCP client, the MCP server, and the human user in sync. Patterns are specified in terms of (i) intent, (ii) required client capabilities, (iii) mechanics (message or notification sequence), (iv) guarantees and failure modes, and (v) UX notes.
+
+Notation. Let EXEC be the developer's original tool logic, PAID the authoritative payment state (as seen by the server), and CONFIRM the act of checking payment state (by polling or webhook-triggered lookup). Safety requires EXEC only after PAID. Liveness requires that under honest participants the system eventually reaches PAID $\rightarrow$ EXEC.
+
+\subsection{TWO\_STEP (request $\rightarrow$ confirm)}
+\paragraph{Intent.} Split the flow into two tools: (1) a request tool that returns \{\texttt{payment\_link}, \texttt{payment\_id}\}; and (2) a confirm tool that takes \texttt{payment\_id}, verifies PAID, and then runs the original logic. Baseline pattern with broad compatibility.
+
+\paragraph{Preconditions (client capabilities).} None beyond standard tool invocation and result rendering.
+
+\paragraph{Mechanics.} \texttt{request\_tool(args)} $\rightarrow$ \{\texttt{payment\_link}, \texttt{payment\_id}\}; persist \{\texttt{args\_snapshot}, user or session identifier, price, \texttt{created\_at}\} keyed by \texttt{payment\_id} in durable storage; then \texttt{confirm\_tool(payment\_id)} $\rightarrow$ (PAID? $\rightarrow$ EXEC(\texttt{args\_snapshot}) : pending). Implementations often wrap the original tool so developers do not duplicate logic.
+
+\noindent Figure~\ref{fig:two-step} illustrates this request-and-confirm interaction.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{diagrams/figure_two_step.pdf}
+  \caption{TWO\_STEP coordination pattern: the server surfaces a payment link and requires an explicit confirmation call before executing the original logic.}
+  \label{fig:two-step}
+\end{figure}
+
+\paragraph{Guarantees and failure modes.}
+\begin{itemize}
+  \item Safety: strong, since EXEC is gated in \texttt{confirm\_tool} and runs against the stored\\ \texttt{args\_snapshot}.
+  \item Liveness: depends on the client surfacing the payment link and the user following it.
+  \item Routing avoidance: models may try cheaper or free alternatives (web search, other tools, local code) unless explicitly instructed to use \texttt{request\_tool} for paid operations.
+  \item Premature confirm: models sometimes call \texttt{confirm\_tool} immediately after \texttt{request\_tool}; implementations typically return a structured pending status that clearly indicates user action is required (and re-issue the canonical link) rather than failing.
+  \item Post-payment argument drift: if the user changes the ask after paying, EXEC typically runs with the captured \texttt{args\_snapshot}; changes after payment introduce a mismatch between what was paid for and what is requested.
+  \item Concurrency mix-ups: with multiple pending payments, the wrong job may run if calls are not uniquely associated with a \texttt{payment\_id}.
+  \item Paid-then-fail: EXEC can error after PAID; compensation or re-run policies may be required by the deployment.
+\end{itemize}
+
+\paragraph{UX notes.} Extra cognitive steps; two tools appear in the catalog; works everywhere but scales poorly in multi-server setups. Expectation mismatch is common: payment authorizes execution of the captured \texttt{args\_snapshot}, not later edits (for example, ``elephant'' paid but user switches to ``giraffe''); communicate this explicitly. When \texttt{confirm\_tool} returns ``pending,'' surface the canonical link again and provide an explicit ``I've paid'' button (or equivalent UI action).
+
+\paragraph{Mitigations (recommended).}
+\begin{itemize}
+  \item Tool descriptions: include price and an explicit instruction to use \texttt{request\_tool} for paid operations; add a short example to reduce routing errors (``If payment is required, call \texttt{request\_tool}, then \texttt{confirm\_tool}'').
+  \item Bind and persist: store \texttt{args\_snapshot} keyed by \texttt{payment\_id}; verify at confirm; enforce single use; cap outstanding intents per user to avoid confusion in parallel requests.
+  \item Premature confirm handling: return \texttt{PENDING} with the canonical link and a brief cooldown to reduce thrashing; log such attempts.
+  \item Failure compensation: provide a cancel or refund path (or credit) when EXEC fails post-PAID; emit a user-facing status and a receipt.
+\end{itemize}
+
+
+\subsection{RESUBMIT (error-based retry with payment ID)}
+\paragraph{Intent.} Add an optional \texttt{payment\_id} parameter to the tool. On the first call the caller omits \texttt{payment\_id}; the server returns a structured MCP error that includes \{\texttt{payment\_link}, \texttt{payment\_id}\}. After the user pays, the caller re-invokes the same tool with \texttt{payment\_id}; the server verifies PAID and then runs EXEC(\texttt{args}).
+
+\paragraph{Preconditions.} The client can surface structured error details (including \texttt{payment\_link} and \texttt{payment\_id}) and retry the same tool call with updated arguments. Ideally, error handling is implemented in the MCP client itself: display the payment link, await completion, and transparently resubmit with \texttt{payment\_id} without invoking the LLM. When this is not available, it is sufficient that the client forwards the full structured error body to the LLM so the model can reliably surface the link and guide a correct retry.
+
+\paragraph{Mechanics.} \texttt{tool(args)} $\rightarrow$ structured error with \{\texttt{payment\_link}, \texttt{payment\_id}\}; user pays; \texttt{tool(args, payment\_id)} $\rightarrow$ (PAID? $\rightarrow$ EXEC(\texttt{args}) : pending). Figure~\ref{fig:resubmit} illustrates this retry-based coordination.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{diagrams/figure_resubmit.pdf}
+  \caption{RESUBMIT coordination pattern: the first call (without \texttt{payment\_id}) returns a payment-required error with a canonical link and identifier; after payment, retrying the same tool with \texttt{payment\_id} executes with the supplied arguments.}
+  \label{fig:resubmit}
+\end{figure}
+
+
+\paragraph{Guarantees and failure modes.}
+\begin{itemize}
+  \item Safety: EXEC only runs after PAID is verified for the provided \texttt{payment\_id}; the server remains the source of truth.
+  \item Liveness: depends on callers (client or LLM) handling error correctly: surfacing the link, awaiting payment, and resubmitting with \texttt{payment\_id}.
+  \item Model-in-the-loop confusion: when the structured error is forwarded to the LLM, the model may (a) ask for a \texttt{payment\_id} before any exists, (b) retry with a stale or hallucinated \texttt{payment\_id}, or (c) call the tool with \texttt{payment\_id} without ever showing the link to the user, leaving them stuck in a ``payment pending'' state.
+  \item Argument drift: arguments are not bound to \texttt{payment\_id} by default in this pattern; the second call executes with whatever arguments are supplied, which may differ from what the user intended to pay for.
+  \item Premature retry: callers may re-submit with \texttt{payment\_id} before payment has settled, causing noisy pending states.
+  \item Hidden or truncated error payloads: some clients strip or downplay structured error bodies; the LLM may see ``payment required'' without the \texttt{payment\_link} or \texttt{payment\_id}, resulting in vague or unhelpful guidance.
+  \item Stale or mismatched identifiers: calls may include unknown, already-consumed, or cross-session \texttt{payment\_id} values if the server does not enforce strict binding.
+\end{itemize}
+
+\paragraph{UX notes.} RESUBMIT keeps a single-tool surface and fits naturally with clients that treat errors as an invitation to retry. The experience is strongly dependent on how error responses are propagated: if the client or LLM hides the link, improvises around the error, or retries without explanation, users may never see a clear ``pay and retry'' path.
+
+
+\paragraph{Mitigations (recommended).}
+\begin{itemize}
+  \item Canonical schema: always return a structured error, machine-readable \texttt{payment\_link} and \texttt{payment\_id}, and a concise instruction (``Open this link to pay, then retry this tool including \texttt{payment\_id}.'').
+  \item Client-first handling: when possible, implement error handling in the MCP client itself (display link, wait for completion, transparently resubmit) instead of delegating all coordination to the LLM.
+  \item Single-use semantics: mark each \texttt{payment\_id} as consumed once PAID and EXEC have succeeded; subsequent uses should be rejected or return an idempotent result to prevent double execution.
+  \item Binding and validation: associate \texttt{payment\_id} with \texttt{args\_snapshot}, user or session, and price; reject mismatched or cross-context identifiers, and log anomalies.
+  \item Retry control: apply minimal backoff or clear \texttt{PENDING} responses to discourage rapid-fire retries while payment is in flight.
+\end{itemize}
+
+\subsection{X402 (on-chain payments)}
+\paragraph{Intent.} Provide an on-chain variation of RESUBMIT using the X402 protocol~\cite{x402}, so that payment is cryptographically bound to a concrete payment request rather than mediated via a generic URL and opaque \texttt{payment\_id}. Instead of returning a browser URL, the server returns a structured X402 payment request that encodes order details (amount, asset, description) and the payee's blockchain address. The pattern is designed primarily for automatic or agent-mediated payments (for example, an MCP client with an attached agent-controlled wallet), but it also supports user-approved flows where a human signs in an existing crypto wallet. The client or wallet signs the payment request and then retries the same tool call with a payment signature; the server verifies the signature and settles on-chain via a facilitator before running EXEC.
+
+%
+\paragraph{Preconditions.} All RESUBMIT preconditions apply, plus the availability of an X402-capable payment provider and a client that understands X402 hand-offs.
+
+We use \emph{facilitator} to mean a payment service that turns a signed X402 request into an on-chain transaction and reports settlement under a configured confirmation policy. We use \emph{provider} to denote the integration layer that creates/verifies X402 requests and exposes settlement status to the MCP server. A \emph{settlement policy} is the confirmation rule (for example, mempool accepted vs. N confirmations) under which the facilitator/provider reports a request as paid.
+
+In practice, the server must be able to emit an X402 payment request either (i) alongside an HTTP 402 status using a response header (for example, \texttt{Payment-Request} or \texttt{X-402-Payment}) or (ii) in the response body, while the MCP client (or a transport adapter) extracts this payload and exposes it to a wallet. (By \emph{Payment-Request header} we mean the transport-layer header that carries the serialized X402 payment request.) After signing, the client retries the tool call with a payment signature that is conveyed either via HTTP headers (for example, \texttt{Payment-Signature} or \texttt{X-Payment}) or in MCP metadata (for example, \texttt{\_meta["x402/payment"]}).
+
+MCP is transport-agnostic and does not mandate HTTP status-code semantics or arbitrary header propagation at the protocol layer; whether 402/headers are visible depends on the transport adapter and client. X402 therefore assumes a specialized client or gateway that bridges between MCP and the underlying X402 transport. In practice, there are currently no general-purpose MCP chat or IDE clients that ship first-class X402 handling; existing deployments rely on custom clients or thin proxies that understand both MCP and X402. As a result, this pattern is best viewed as a specialized option for controlled environments rather than a default choice for broad public use.
+
+In this pattern, a ``payment signature'' denotes a cryptographic signature over the X402 payment request that the facilitator can use to construct and submit an on-chain transaction on behalf of the payer; depending on the chain and wallet, this may be represented as a signed transaction payload.
+
+\paragraph{Mechanics.} The client first calls the paid tool without a payment signature: \texttt{tool(args)}. The server constructs an X402 payment request from the captured \texttt{args\_snapshot} and returns a structured failure that carries the payment request (often using HTTP status 402 on the underlying transport). The client obtains a payer signature on this request from a wallet (either automatically via an agent-controlled key or by prompting the user to sign in an existing crypto wallet) and then retries the same tool call with the payment signature attached (header or metadata). The server verifies the signature and, through an X402 provider or facilitator, settles the transaction on-chain or schedules settlement according to the configured confirmation policy; only after the facilitator reports the transaction as settled under that policy does the server execute EXEC(\texttt{args\_snapshot}) and return the tool result.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{diagrams/figure_x402.pdf}
+  \caption{X402 coordination pattern: the first call returns a 402 Payment Required response carrying an X402 payment request; the client or wallet signs a transaction and then retries the same tool with \texttt{payment\_signature}, after which the server verifies and executes with the original arguments.}
+  \label{fig:x402}
+\end{figure}
+
+\paragraph{Guarantees and failure modes.}
+\begin{itemize}
+  \item \textbf{Safety:} stronger argument binding than generic RESUBMIT when the X402 payment request commits to an \texttt{args\_snapshot} hash, amount, and destination address. EXEC only runs after a valid payer signature has been verified and the provider reports PAID for the corresponding request.
+  \item \textbf{Liveness:} depends on the availability of an X402-aware client, the responsiveness of the underlying chain, and wallet UX. Mempool congestion, confirmation delays, or facilitator outages can stall execution even when the MCP session remains healthy.
+  \item \textbf{Transport mismatch:} if the MCP client ignores HTTP 402 status codes or drops server-set headers, it may never surface the X402 payment request to the wallet or user. In such environments X402 silently degrades into a permanent error state rather than a usable payment flow.
+  \item \textbf{Signature channel variance:} different clients may choose headers versus metadata for returning the payment signature; misconfiguration or partial adoption can lead to EXEC never running even though the user has signed the request.
+  \item \textbf{Wallet trust and limits:} when an agent-controlled wallet signs automatically, bugs or prompt injection may cause unintended on-chain spend; when a user wallet is involved, complex signing prompts or repeated requests can cause confusion or consent fatigue.
+  \item \textbf{Gas funding:} on-chain settlement requires gas. Deployments must decide whether the payer funds gas directly or a facilitator front-runs gas and recovers costs; misconfigured gas policies can cause paid-but-unsettled states.
+  \item \textbf{Ecosystem maturity:} as of submission, X402 support in MCP tooling is limited to custom clients or gateways; generic MCP clients do not expose X402 payment requests directly, which constrains interoperability and discoverability.
+\end{itemize}
+
+\paragraph{UX notes.} Like RESUBMIT, X402 preserves a single tool surface and avoids introducing extra confirm tools or explicit payment parameters; the visible tool catalog does not change between the pre- and post-payment calls. In practice the pattern works best when payments are largely automatic (agent-to-agent or agent-controlled wallet) and the MCP client takes responsibility for surfacing any human signing prompts and handling retries while keeping the LLM unaware of the underlying payment flow. The coordination logic is implemented in the MCP client and wallet layers: the LLM typically cannot inspect or manipulate the X402 payment request, and generic tool descriptions are insufficient to teach models how to complete the flow. On-chain confirmation may take seconds or longer, so users may perceive the tool as slow or flaky if progress is not surfaced clearly. Because error payloads are protocol-specific rather than natural language, debugging X402 failures can be harder than debugging plain RESUBMIT, especially in custom clients.
+
+\paragraph{Mitigations (recommended).}
+\begin{itemize}
+  \item \textbf{Explicit binding:} include a hash of \texttt{args\_snapshot}, price, and destination address in the X402 payment request; verify this binding before EXEC to prevent post-payment argument drift.
+  \item \textbf{Client gating:} only enable X402 mode for clients known to be X402-aware (for example, via configuration or a declared capability flag); fall back to plain RESUBMIT when X402 headers or metadata are not supported.
+  \item \textbf{Header/metadata abstraction:} hide the differences between header-based and metadata-based signatures behind a thin SDK layer so server-side logic sees a single \texttt{payment\_signature} input; emit structured diagnostics when signatures are missing or invalid.
+  \item \textbf{Spend controls:} enforce per-user and per-tool spend limits, daily caps, and amount thresholds that require explicit user confirmation even when an agent-controlled wallet is available.
+  \item \textbf{Progress signaling:} consider sending progress notifications or similar status updates where the client reliably displays human-readable messages so users understand that (i) a payment is being prepared, (ii) a wallet prompt is expected, and (iii) on-chain confirmation may take time.
+  \item \textbf{Fallback paths:} when settlement fails or times out, return a structured error that explains the failure and, where appropriate, suggests a non-on-chain alternative (for example, a traditional RESUBMIT flow or manual payment).
+\end{itemize}
+
+\subsection{ELICITATION (in-flow request and confirm)}
+\paragraph{Intent.} Before executing the main logic, create a payment intent and link, pause via elicitation, and present the user a minimal form (payment link plus ``I've paid'' button). After the user confirms and the server verifies PAID (webhook or poll), resume and run the original logic. This keeps a single-tool surface and tends to reduce LLM routing risk.
+
+\paragraph{Preconditions.} Client supports elicitation (server to client prompt during tool execution) and renders it inline; recommended: extendable or long timeouts and session restore across reconnects.
+
+\paragraph{Mechanics.} Tool invoked $\rightarrow$ server captures \texttt{args\_snapshot} and creates \{\texttt{payment\_link},\\ \texttt{payment\_id}\} $\rightarrow$ server elicits a form \{\texttt{url}, ``I've paid'' button\} $\rightarrow$ client surfaces it; user pays and clicks confirm $\rightarrow$ server checks \texttt{PAID(payment\_id)} via webhook or poll $\rightarrow$ (PAID? $\rightarrow$ resume EXEC(\texttt{args\_snapshot}) : return \texttt{PENDING} and re-elicit).
+
+\noindent The overall elicitation flow is shown in Figure~\ref{fig:elicitation}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{diagrams/figure_elicitation.pdf}
+  \caption{ELICITATION coordination pattern: the server pauses execution, prompts the user to complete payment, and resumes once payment is verified.}
+  \label{fig:elicitation}
+\end{figure}
+
+\paragraph{Guarantees and failure modes.}
+\begin{itemize}
+  \item Safety: strong if the resume path re-checks PAID and executes against the stored\\ \texttt{args\_snapshot}.
+  \item Liveness: high when the elicitation UI is rendered and timeouts are adequate.
+  \item Uneven client support: some clients do not yet implement elicitation, so the flow may silently degrade.
+  \item Elicitation timeout or abandonment: many clients impose short inactivity timeouts; payment may complete after the tool has errored. The user returns with ``I've paid,'' but the model has no in-flight context.
+  \item Session restore: interrupted elicitations are common; when restore or reattach is unavailable, users and servers face recovery complexity and may lose context.
+  \item Backgrounding or navigation: mobile or tab background throttling or navigation can drop the elicitation UI; if redisplay is not possible, users may miss the link and be unable to confirm.
+\end{itemize}
+
+\paragraph{UX notes.} True single-tool surface (no extra confirm tool) with fewer routing errors than TWO\_STEP, but portability depends on client maturity. Set expectations that users can pay and return; on resume, show clear states (awaiting payment $\rightarrow$ checking $\rightarrow$ resumed).
+
+\paragraph{Mitigations (recommended).}
+\begin{itemize}
+  \item Timeouts: set generous client or server time budgets; send lightweight keepalives during the pause; allow extension.
+  \item Resume or reattach: persist \{\texttt{payment\_id}, \texttt{args\_snapshot}\}. On a subsequent ``I've paid'' message, detect PAID and resume; expose a ``Resume payment'' control.
+  \item Lost context fallback: if resume is impossible, re-issue the canonical link and confirmation instructions, or fall back to TWO\_STEP or RESUBMIT for completion.
+  \item Structured links: when available, use a dedicated \texttt{url} field in the elicitation form; otherwise include the link in the UI body.
+\end{itemize}
+
+\subsection{PROGRESS (notify and poll)}
+\paragraph{Intent.} On invocation, emit a progress update that carries the payment link and instructions; wait for PAID via webhook or polling and only then execute the original logic. This preserves a single-tool surface but relies on the client displaying progress message text.
+
+\paragraph{Preconditions.} Client renders progress notifications \emph{and} displays human-readable message text; clickable links are not guaranteed. Long or extendable timeouts recommended.
+
+\paragraph{Mechanics.} Tool invoked $\rightarrow$ server captures \texttt{args\_snapshot} and creates \{\texttt{payment\_link},\\ \texttt{payment\_id}\} $\rightarrow$ server emits periodic progress messages containing the canonical link (often non-clickable; users may need to copy or paste) $\rightarrow$ server polls or awaits \texttt{PAID(payment\_id)} $\rightarrow$ (PAID? $\rightarrow$ EXEC(\texttt{args\_snapshot}) and finish : continue reporting or timeout).
+
+\noindent Figure~\ref{fig:progress} depicts this streaming coordination pattern.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{diagrams/figure_progress.pdf}
+  \caption{PROGRESS coordination pattern: the server streams status updates that include payment instructions while awaiting confirmation.}
+  \label{fig:progress}
+\end{figure}
+
+\paragraph{Guarantees and failure modes.}
+\begin{itemize}
+  \item Safety: strong if EXEC only runs post-PAID and against the stored \texttt{args\_snapshot}.
+  \item Liveness: fragile when clients hide progress message text or throttle updates; the user will not learn that payment is required.
+  \item Non-clickable links: even where text is visible, in several clients URLs are displayed as plain text rather than actionable links; users must copy or paste, increasing drop-off.
+  \item Timeout or abandonment: clients often enforce short inactivity or runtime limits; payment may complete after the tool has errored. The user returns with ``I've paid,'' but there is no in-flight context to resume.
+  \item Resume requirement: in practice, servers accept a subsequent message, re-check \\\texttt{PAID(payment\_id)}, and complete EXEC; without resume or reattach, users can be stuck despite having paid.
+  \item Backgrounding or navigation: tab or mobile backgrounding can suppress progress rendering, further reducing discoverability of the link.
+\end{itemize}
+
+\paragraph{UX notes.} Works where message text is actually shown; if it is hidden, users typically will not realize payment is required. Even when shown, links may be non-clickable (copy or paste). Communicate clearly that payment happens outside the tool and that completion may take a moment to be detected.
+
+\paragraph{Mitigations (recommended).}
+\begin{itemize}
+  \item Capability check: only choose PROGRESS when the client reliably displays progress message text; otherwise select ELICITATION or TWO\_STEP or RESUBMIT.
+  \item Keepalive and budgets: send periodic progress to keep sessions alive; negotiate longer client or server timeouts where possible.
+  \item Resume or reattach: persist \{\texttt{payment\_id}, \texttt{args\_snapshot}\}; on a later ``I've paid'' message, detect PAID and complete EXEC; optionally expose a one-shot confirm tool as a fallback.
+  \item Canonical link: include the same URL in every progress message; avoid per-message links to reduce mismatch.
+  \item Prefer structured URLs: when a client supports URL\_ELICITATION or a dedicated \texttt{url} field, use that instead of free-text links.
+\end{itemize}
+
+\subsection{DYNAMIC\_TOOLS (via \texorpdfstring{\texttt{tools/listChanged}}{tools/listChanged})}
+\paragraph{Intent.} Guide the next valid action by changing the visible tool set at specific points (for example, temporarily expose a \texttt{confirm\_payment\_\{short\_id\}} tool), so the model and user are steered toward payment confirmation before execution.
+
+\paragraph{Preconditions.} Client implements dynamic tool listings and reacts to the \texttt{notifications\allowbreak/tools/list\_changed} notification by refreshing the tool list (caching disabled or cache busted).
+
+\paragraph{Mechanics.} Tool invoked $\rightarrow$ server captures \texttt{args\_snapshot} and creates \{\texttt{payment\_link},\\ \texttt{payment\_id}\} $\rightarrow$ server returns the link or instructions and emits \texttt{notifications/tools/list\_changed} to reveal a scoped \texttt{confirm\_payment\_\{short\_id\}} tool $\rightarrow$ client refreshes tool list $\rightarrow$ model calls \texttt{confirm\_payment\_\{short\_id\}(payment\_id)} $\rightarrow$ server verifies \texttt{PAID(payment\_id)} and runs\\ EXEC(\texttt{args\_snapshot}) $\rightarrow$ server emits \texttt{notifications/tools/list\_changed} to hide the temporary tool and restore the original set.
+
+This dynamic adjustment of the tool set is illustrated in Figure~\ref{fig:dynamic-tools}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.75\textwidth]{diagrams/figure_dynamic_tools.pdf}
+  \caption{DYNAMIC\_TOOLS coordination pattern: the server adjusts the advertised tool set so that only the next valid payment action is visible.}
+  \label{fig:dynamic-tools}
+\end{figure}
+
+\paragraph{Guarantees and failure modes.}
+\begin{itemize}
+  \item Safety: strong when EXEC is only reachable via the confirm tool, which re-checks PAID and executes against \texttt{args\_snapshot}.
+  \item Liveness: depends on the client honoring \texttt{list\_changed} and actually refreshing the tool list; stale caches silently break the flow.
+  \item Flicker or caching: tools appearing or disappearing can confuse users and models; aggressive caching can leave phantom or missing tools.
+  \item Concurrency: multiple pending intents can expose multiple confirm tools; without a one-to-one association to \texttt{payment\_id} and single-consumption semantics, the wrong job may execute.
+  \item Naming or ambiguity: a generic confirm tool name invites misrouting; lack of namespacing (for example, \texttt{confirm\_payment\_\{short\_id\}}) and concise instructions increases error rates.
+  \item Notification loss or reordering: missed or out-of-order \texttt{list\_changed} events strand the user.
+\end{itemize}
+
+\paragraph{UX notes.} Explicit confirm tools reduce wrong-tool calls and make the required next step obvious, but flicker and list refreshes can feel jumpy.
+
+\paragraph{Mitigations (recommended).}
+\begin{itemize}
+  \item Namespace and bind: expose \texttt{confirm\_payment\_\{short\_id\}} and require \texttt{payment\_id}; store \texttt{args\_snapshot}; verify at confirm; hide on completion.
+  \item TTL and cleanup: set expirations for temporary tools; always emit a final \texttt{list\_changed} to restore the base set.
+  \item Capability probe: detect dynamic-tools support at init; fall back to TWO\_STEP when unavailable.
+\end{itemize}
+
+\subsection{URL\_ELICITATION (emerging)}
+\paragraph{Status (January 2026).} URL-mode elicitation was added in the MCP 2025-11-25 specification update as a standardized way (SEP-1036) for servers to request that clients handle outbound URLs explicitly during elicitation. As of January 2026, SDK and client adoption remain limited: only a subset of clients declare or honor \texttt{mode: "url"} in elicitation flows. For payment scenarios, this pattern is a nearly ideal refinement of ELICITATION where supported, but implementers should assume that many deployed clients will not yet expose URL-mode elicitation capabilities.
+
+\paragraph{Intent.} Increase reliability of payment or OAuth hand-offs by using elicitation in \texttt{mode: "url"} so the client presents a dedicated URL prompt instead of relying on free-text links in forms or progress messages.
+
+\paragraph{Preconditions.} Client declares \texttt{capabilities.elicitation.url} (explicit mode negotiation) and correctly handles URL prompts; the server still learns completion via webhook or polling.
+
+\paragraph{Mechanics.} Server issues an elicitation with \texttt{mode: "url"}, providing an \texttt{elicitationId}, a \texttt{url}, and a human-readable \texttt{message}. The client prompts the user and may launch the browser. The server observes completion via webhook or polling, re-checks PAID, and then resumes or confirms and executes EXEC.
+
+\paragraph{Guarantees and failure modes.}
+\begin{itemize}
+  \item Link reliability: higher than free text; the URL is conveyed via a structured field that clients are expected to handle.
+  \item Dependency on backend confirmation: requires robust webhook or polling and idempotent confirm; otherwise the server may stall awaiting PAID.
+  \item Compatibility: even though URL-mode elicitation is now specified, many clients and SDKs do not yet implement \texttt{mode: "url"} or do so only partially; fall back to plain ELICITATION (form) or non-elicitation patterns such as RESUBMIT where necessary.
+  \item Timeouts and backgrounding: the hand-off happens outside the client; users may return after client or server time budgets expire.
+\end{itemize}
+
+\paragraph{UX notes.} More predictable than free-text links and, where supported, one of the cleanest options for handing off to external payment providers. The underlying message sequence is the same as ELICITATION in Figure~\ref{fig:elicitation}; the main difference is that the URL is carried in a dedicated \texttt{url} field and clients may treat it specially (for example, by opening a browser or rendering a focused prompt). Pair this mode with security controls (origin pinning for outbound URLs, signed webhooks with replay protection), and provide clear fallback behavior when the client does not declare URL elicitation support.
+
+% Implementation Notes section
+\section{Implementation Notes (Reference SDK)}
+We present a thin wrapper---PayMCP (MIT, open-source)~\cite{paymcp}---that transforms a developer tool EXEC into a payment-gated tool without duplicating business logic. The wrapper enforces payment gating (EXEC only after PAID) and supports multiple payment flows configured via a \texttt{mode} parameter.
+
+\subsection{Wrapper architecture}
+\begin{itemize}
+  \item \textbf{Intercept}: on tool invocation, the wrapper checks configuration (price, currency, provider) and captures an \texttt{args\_snapshot}.
+  \item \textbf{Orchestrate}: depending on the selected pattern, it issues a link (request), elicits confirmation, emits progress, or exposes a confirm tool; when required by the selected mode, the server creates a payment intent to obtain \{\texttt{payment\_link}, \texttt{payment\_id}\}.
+  \item \textbf{Gate}: EXEC runs only after \texttt{confirm(payment\_id)} returns PAID.
+  \item \textbf{Resume and finalize}: return the tool's original result; tidy temporary state (for example, dynamic tools) and log outcomes.
+\end{itemize}
+
+\subsection{Capability detection}
+Today, the library supports both explicit \texttt{mode} configuration (TWO\_STEP $\mid$ RESUBMIT $\mid$ X402 $\mid$ ELICITATION $\mid$ PROGRESS $\mid$ DYNAMIC\_TOOLS) and an \texttt{AUTO} selector. With an explicit mode, developers pin a specific coordination pattern regardless of client behavior. In \texttt{Mode.AUTO}, the wrapper inspects the client's declared capabilities during MCP initialization and chooses a pattern accordingly: when an X402-capable client is detected and the server is configured with an X402 provider, it prefers X402; otherwise, if elicitation is supported it prefers ELICITATION; if neither is available, it falls back to RESUBMIT as a conservative default (as a single-tool surface). This selection is based on declared capabilities rather than runtime observation, so misreported client capabilities may still require manual overrides in some deployments.
+
+\subsection{Reliability primitives (timeouts, resume, idempotency)}
+On timeouts or interrupted streams, the wrapper attempts to resume using \texttt{Last-Event-ID} when the client supports it. Confirmation \texttt{confirm(payment\_id)} is idempotent; the server persists a crash-safe binding \texttt{payment\_id} $\rightarrow$ \texttt{args\_snapshot} with single-consumption semantics to prevent double execution. Polling uses bounded intervals, and server-side time budgets are configurable.
+
+\subsection{Completion channels (polling now; webhooks planned)}
+The current implementation uses polling to learn \texttt{PAID}. We plan to add an optional webhook channel with signature verification and automatic setup where possible; until then, polling remains the default. In all cases, the authoritative payment state is re-checked immediately before running EXEC.
+
+\subsection{Status reporting}
+The wrapper returns concise statuses in tool responses (and, when applicable, in elicitation or progress messages): \texttt{paid}, \texttt{failed}, \texttt{pending}, and \texttt{canceled}. Identifiers returned to the client are minimized; logs avoid including sensitive values.
+
+\subsection{Minimal example (Python)}
+
+\begin{lstlisting}[language=Python, caption={Minimal payment-gated tool using PayMCP}, label={lst:python-example}]
+from mcp.server.fastmcp import FastMCP, Context
+from paymcp import PayMCP, price, Mode
+
+mcp = FastMCP("demo-server")
+
+# Initialize the payment wrapper. `mode` selects the coordination pattern.
+PayMCP(
+    mcp,
+    providers=[...],
+    mode=Mode.AUTO  # TWO_STEP | RESUBMIT | X402 | ELICITATION | PROGRESS | DYNAMIC_TOOLS
+)
+
+@mcp.tool()
+@price(amount=1.00, currency="USD")
+def compute_total(a: int, b: int, ctx: Context) -> int:
+    """Add two payment parameters and return the result"""
+    return a + b
+\end{lstlisting}
+
+For TypeScript usage, see the online documentation or repository examples.
+
+
+% Security Considerations section
+\section{Security Considerations and SAFE-MCP Framework}
+\label{sec:security}
+
+Payment coordination in MCP introduces new attack surfaces that practitioners must address. The SAFE-MCP framework~\cite{safe-mcp} provides a structured taxonomy of threats specific to MCP environments, adapting the MITRE ATT\&CK methodology for AI agent security.
+
+\subsection{Payment-Relevant Threat Categories}
+
+Several SAFE-MCP techniques directly impact payment coordination patterns:
+
+\paragraph{Initial Access Threats.}
+\begin{itemize}
+    \item \textbf{SAFE-T1001 (Tool Poisoning Attack)}: Malicious instructions embedded in tool descriptions could manipulate payment flows---e.g., redirecting \texttt{payment\_link} or altering\\ \texttt{args\_snapshot} before confirmation.
+    \item \textbf{SAFE-T1007 (OAuth Authorization Phishing)}: Particularly relevant for \\URL\_ELICITATION where OAuth flows hand off to external payment providers.
+\end{itemize}
+
+\paragraph{Execution and Persistence.}
+\begin{itemize}
+    \item \textbf{SAFE-T1201 (MCP Rug Pull)}: Time-delayed changes to tool definitions could alter payment gating logic after initial user approval---critical for TWO\_STEP and DYNAMIC\_TOOLS patterns.
+    \item \textbf{SAFE-T1202 (OAuth Token Persistence)}: Stolen refresh tokens could enable unauthorized payment confirmations.
+\end{itemize}
+
+\paragraph{Defense Evasion.}
+\begin{itemize}
+    \item \textbf{SAFE-T1403 (Consent Fatigue)}: Repeated benign payment prompts desensitize users, hiding a malicious transaction mid-flow.
+\end{itemize}
+
+\subsection{Pattern-Specific Security Analysis}
+
+Table~\ref{tab:safe-mcp-threats} maps SAFE-MCP techniques to the payment coordination patterns introduced in this paper.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccccccc}
+\toprule
+Technique & TWO\_STEP & RESUBMIT & ELICIT. & PROGRESS & DYN. & URL\_E. & X402 \\
+\midrule
+SAFE-T1001 & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+SAFE-T1007 & -- & -- & -- & -- & -- & \checkmark & -- \\
+SAFE-T1201 & -- & -- & -- & -- & \checkmark & -- & -- \\
+SAFE-T1403 & \checkmark & -- & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\caption{SAFE-MCP threat applicability by payment pattern. \checkmark indicates the pattern is susceptible; -- indicates limited applicability.}
+\label{tab:safe-mcp-threats}
+\end{table}
+
+\subsection{Recommended Mitigations}
+
+For payment-gated MCP tools, we recommend the following mitigations aligned with SAFE-MCP guidance:
+
+\begin{enumerate}
+    \item \textbf{Cryptographic binding (SAFE-M-2)}: Associate \texttt{payment\_id} with a server-signed\\ \texttt{args\_snapshot} (or its hash) and verify the binding on confirmation to prevent post-payment argument drift.
+    \item \textbf{Unicode sanitization (SAFE-M-4)}: Filter Unicode injection and hidden instructions from tool metadata before display.
+    \item \textbf{Origin validation}: For URL\_ELICITATION, verify payment callback URLs against allowlists to prevent OAuth mix-up attacks (SAFE-T1306, SAFE-T1307).
+    \item \textbf{Rate limiting on confirmations}: Implement cooldowns between payment confirmations to mitigate consent fatigue exploitation.
+\end{enumerate}
+
+\subsection{Limitations}
+
+This security analysis has several limitations that practitioners should consider:
+
+\begin{itemize}
+    \item \textbf{Taxonomy scope}: Our pattern taxonomy is based on the MCP specification as of January 2026. As the protocol evolves, new patterns may emerge and existing ones may become obsolete.
+    \item \textbf{Client implementation variance}: The effectiveness of each pattern depends heavily on client implementation quality. Patterns that work well on one client may fail silently on another due to incomplete feature support.
+    \item \textbf{Threat model assumptions}: The SAFE-MCP threat mappings assume adversaries target the MCP layer specifically. Attacks that exploit underlying transport (HTTP, WebSocket) or host system vulnerabilities are outside our scope.
+    \item \textbf{No empirical validation}: The compatibility snapshot relies on publicly declared feature matrices rather than controlled experiments. Actual behavior may differ from declared capabilities.
+    \item \textbf{Payment provider integration}: We do not address the security of external payment providers (Stripe, PayPal, etc.) or the cryptographic soundness of payment confirmation mechanisms.
+    \item \textbf{Model behavior variability}: LLM tool selection is inherently non-deterministic. Our patterns mitigate but cannot eliminate the risk of models bypassing payment gates through unexpected tool sequences.
+\end{itemize}
+
+Future work should include empirical testing across multiple clients, formal verification of payment coordination invariants, and longitudinal studies of pattern effectiveness as the MCP ecosystem matures.
+
+
+% --- Compatibility Snapshot (non-empirical, Jan 5, 2026) (REWRITTEN SECTION) ---
+\section{Compatibility Snapshot (non-empirical, Jan 5, 2026)}
+\label{sec:compatibility}
+
+\paragraph{Scope and sources.} We report a descriptive (non-experimental) snapshot of client support relevant to payment coordination portability. Data is taken from the official \emph{Example Clients $\rightarrow$ Feature support matrix} (accessed Jan~5,~2026) and from the capabilities advertised in clients' MCP \texttt{initialize} messages captured during routine connections. These sources describe \emph{declared} protocol capabilities; they do not fully characterize end-to-end user experience.
+
+\paragraph{Client selection.} Clients were chosen to represent general-purpose chat and IDE integrations with broad distribution, rather than specialized or experimental tooling. The list is illustrative and not a market-share ranking.
+
+Table~\ref{tab:client-support} summarizes declared client support for payment coordination patterns across commonly used MCP clients.
+
+\begin{table}[H]
+  \centering
+  \small
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{>{\raggedright\arraybackslash}p{4.3cm}*{7}{>{\centering\arraybackslash}p{0.65cm}}}
+    \toprule
+    Client & TS & RS & PR & EL & DT & URL & X \\
+    \midrule
+    Cursor & \checkmark & \checkmark &  & \checkmark &  &  &  \\
+    VS Code GitHub Copilot & \checkmark & \checkmark &  & \checkmark &  &  &  \\
+    Claude Desktop App & \checkmark & \checkmark &  &  &  &  &  \\
+    Claude Code & \checkmark & \checkmark &  &  &  &  &  \\
+    ChatGPT & \checkmark & \checkmark &  &  &  &  &  \\
+    Codex & \checkmark & \checkmark &  & \checkmark &  &  &  \\
+    Gemini CLI & \checkmark & \checkmark &  &  &  &  &  \\
+    \bottomrule
+    \addlinespace
+    \multicolumn{8}{l}{\footnotesize TS = TWO\_STEP,\; RS = RESUBMIT,\; PR = PROGRESS,\; EL = ELICITATION,}\\
+    \multicolumn{8}{l}{\footnotesize DT = DYNAMIC\_TOOLS,\; URL = URL\_ELICITATION,\; X = X402.}
+  \end{tabular}
+  \caption{Declared MCP client support by payment coordination pattern (Jan~5,~2026).}
+  \label{tab:client-support}
+\end{table}
+
+\paragraph{How to read the table.} TS (TWO\_STEP) and RS (RESUBMIT) require only baseline tool invocation and are therefore broadly portable across MCP clients. By contrast, PR (PROGRESS) and DT (DYNAMIC\_TOOLS) depend on client-side behavior that is not captured reliably by declared capabilities alone: PR requires that the client actually surfaces the optional progress \texttt{message} field to the user, and DT requires that the client reacts to \texttt{notifications/tools/list\_changed} by refreshing the tool catalog. URL denotes URL\_ELICITATION (SEP-1036), and X denotes the external X402 payment protocol.
+
+
+\paragraph{Key portability caveats.} Although some clients advertise support for progress notifications, in mainstream chat and IDE clients the optional progress \texttt{message} text is often not rendered to users (or is rendered in a way that makes URLs unusable). Because the PROGRESS payment pattern relies on that human-visible message channel to convey the payment link, we treat PROGRESS as non-portable and leave PR unmarked unless a specific client is validated end-to-end.
+
+Similarly, DYNAMIC\_TOOLS assumes that clients refresh the tool catalog when receiving \texttt{notifications/tools/list\_changed}. In practice, many clients treat the tool list as effectively static after initial discovery (for example, caching the initial \texttt{tools/list} result) and do not reliably react to \texttt{list\_changed}, which silently breaks dynamic confirmation-tool flows. We therefore leave DT unmarked as a conservative default.
+
+URL\_ELICITATION is standardized via SEP-1036~\cite{sep1036}, but as of January~2026 it is not broadly implemented by the most widely used clients; deployments should assume limited availability and provide fallbacks (for example, plain ELICITATION or RESUBMIT / TWO\_STEP). Finally, X402~\cite{x402} is an \emph{external} on-chain payment protocol rather than an MCP specification feature; practical use therefore requires a custom client, gateway, or wallet-integrated environment that explicitly implements the X402 handshake.
+
+\paragraph{Implication.} For broad compatibility today, it is preferable to select a coordination pattern based on the specific client's observed behavior and declared capabilities (or to delegate this choice to a wrapper-level \texttt{AUTO} mode) rather than hard-coding a single default. In our reference SDK, \texttt{Mode.AUTO} prefers X402 only when an X402-aware client and provider are available, otherwise prefers ELICITATION when supported, and falls back to RESUBMIT as a conservative default. TWO\_STEP remains a robust explicit fallback when client capabilities are minimal. We recommend treating PROGRESS, DYNAMIC\_TOOLS, and URL\_ELICITATION as experimental unless validated for the target client.
+
+\begin{thebibliography}{9}
+
+\bibitem{mcp-spec-2025-11-25}
+Model Context Protocol Specification (2025-11-25).\newline
+\url{https://modelcontextprotocol.io/specification/2025-11-25}
+
+\bibitem{mcp-architecture}
+MCP Architecture Overview.\newline
+\url{https://modelcontextprotocol.io/docs/learn/architecture}
+
+\bibitem{mcp-tools}
+MCP Server Tools Capability.\newline
+\url{https://modelcontextprotocol.io/specification/2025-11-25/server/tools}
+
+\bibitem{mcp-elicitation}
+MCP Client Elicitation Capability.\newline
+\url{https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation}
+
+\bibitem{mcp-progress}
+MCP Progress Notifications Utility.\newline
+\url{https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress}
+
+\bibitem{mcp-schema}
+MCP Protocol Schema (including notifications).\newline
+\url{https://modelcontextprotocol.io/specification/2025-11-25/schema}
+
+\bibitem{mcp-security-best-practices} % Renamed from mcp-security
+MCP Security Best Practices.\newline
+\url{https://modelcontextprotocol.io/specification/2025-11-25/basic/security_best_practices}
+
+\bibitem{mcp-clients}
+Model Context Protocol Client Feature Matrix.\newline
+\url{https://modelcontextprotocol.io/clients}
+
+\bibitem{sep1036}
+MCP Specification Changelog (2025-11-25): Added URL mode elicitation (SEP-1036).\newline
+\url{https://modelcontextprotocol.io/specification/2025-11-25/changelog}
+
+\bibitem{x402}
+X402 Protocol.\newline
+\url{https://www.x402.org}
+
+\bibitem{paymcp}
+PayMCP SDK (GitHub Repository).\newline
+\url{https://github.com/PayMCP/paymcp}
+
+\bibitem{safe-mcp}
+SAFE-MCP: Security Analysis Framework for Evaluation of Model Context Protocol (OpenSSF SIG-SAFE-MCP).\newline
+\url{https://github.com/SAFE-MCP/safe-mcp}
+
+\end{thebibliography}
+
+
+\vspace{2em}
+\begin{center}
+\small Version 3, January 2026
+\end{center}
+
+\end{document}
